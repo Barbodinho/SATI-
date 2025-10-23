@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Telegram Panel Bot
+------------------
+Simple bot for selling Marzban/Pasargad panels.
+First run asks for TELEGRAM_BOT_TOKEN and ADMIN_TG_ID, stores them in .env.
+Creates SQLite DB, initializes admin, and runs via aiogram polling.
+"""
+
+import os
+import sys
+import sqlite3
+from pathlib import Path
+from getpass import getpass
+from dotenv import load_dotenv
+
+# ====== ENV ======
+ENV_PATH = Path(".env")
+
+def bootstrap_env():
+    load_dotenv(dotenv_path=ENV_PATH)
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    admin_id = os.getenv("ADMIN_TG_ID")
+
+    changed = False
+    if not token:
+        print("🔑 Enter your Telegram bot token:")
+        token = getpass("TELEGRAM_BOT_TOKEN = ").strip()
+        changed = True
+    if not admin_id:
+        print("👤 Enter your admin Telegram numeric ID:")
+        admin_id = input("ADMIN_TG_ID = ").strip()
+        if not admin_id.isdigit():
+            print("❌ ADMIN_TG_ID must be numeric.")
+            sys.exit(1)
+        changed = True
+
+    if changed:
+        with open(ENV_PATH, "w", encoding="utf-8") as f:
+            f.write(f"TELEGRAM_BOT_TOKEN={token}\n")
+            f.write(f"ADMIN_TG_ID={admin_id}\n")
+        print("✅ .env file created/updated.")
+
+    load_dotenv(dotenv_path=ENV_PATH)
+    return os.getenv("TELEGRAM_BOT_TOKEN"), int(os.getenv("ADMIN_TG_ID"))
+
+# ====== DATABASE ======
+DB_PATH = Path("bot.db")
+SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tg_id INTEGER UNIQUE NOT NULL,
+  username TEXT,
+  balance REAL DEFAULT 0,
+  is_admin INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT,
+  price REAL NOT NULL,
+  sku TEXT UNIQUE,
+  stock INTEGER,
+  allow_test INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+"""
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db_and_admin(admin_tg_id: int):
+    conn = db()
+    with conn:
+        conn.executescript(SCHEMA_SQL)
+        cur = conn.execute("SELECT id FROM users WHERE tg_id=?", (admin_tg_id,))
+        if not cur.fetchone():
+            conn.execute(
+                "INSERT INTO users (tg_id, is_admin) VALUES (?,1)", (admin_tg_id,)
+            )
+            print(f"✅ Admin user {admin_tg_id} added.")
+    conn.close()
+
+# ====== DATA FUNCS ======
+def is_admin_tg(tg_id: int) -> bool:
+    conn = db()
+    cur = conn.execute("SELECT is_admin FROM users WHERE tg_id=?", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row["is_admin"])
+
+def add_product(name, price, desc="", allow_test=False):
+    conn = db()
+    with conn:
+        conn.execute(
+            "INSERT INTO products(name, price, description, allow_test) VALUES(?,?,?,?)",
+            (name, price, desc, int(allow_test))
+        )
+    conn.close()
+
+def get_products():
+    conn = db()
+    rows = conn.execute("SELECT * FROM products").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def set_setting(key, value):
+    conn = db()
+    with conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value)
+        )
+    conn.close()
+
+def get_setting(key):
+    conn = db()
+    cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+# ====== BOT ======
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils import executor
+
+def build_bot(token):
+    bot = Bot(token=token)
+    dp = Dispatcher(bot, storage=MemoryStorage())
+    return bot, dp
+
+def main_menu(admin=False):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📦 محصولات", "💰 افزایش موجودی")
+    if admin:
+        kb.add("⚙️ پنل مدیریت")
+    return kb
+
+# Handlers
+def register_handlers(dp, bot):
+    @dp.message_handler(commands=["start"])
+    async def start(msg: types.Message):
+        admin = is_admin_tg(msg.from_user.id)
+        await msg.answer("سلام! به ربات فروش خوش اومدی 👋", reply_markup=main_menu(admin))
+
+    @dp.message_handler(lambda m: m.text == "📦 محصولات")
+    async def show_products(msg: types.Message):
+        prods = get_products()
+        if not prods:
+            await msg.answer("فعلاً هیچ محصولی ثبت نشده.")
+            return
+        for p in prods:
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("خرید", callback_data=f"buy:{p['id']}"))
+            if p["allow_test"]:
+                kb.add(types.InlineKeyboardButton("تست", callback_data=f"test:{p['id']}"))
+            await msg.answer(
+                f"🔹 {p['name']}\n💵 قیمت: {p['price']:,.0f}\n📜 {p['description'] or '-'}",
+                reply_markup=kb
+            )
+
+    @dp.message_handler(lambda m: m.text == "⚙️ پنل مدیریت")
+    async def admin_panel(msg: types.Message):
+        if not is_admin_tg(msg.from_user.id):
+            return await msg.answer("⛔️ شما ادمین نیستید.")
+        await msg.answer(
+            "فرمان‌ها:\n"
+            "/add_product نام | قیمت | [اجازه تست 0/1] | توضیح\n"
+            "/set_card شماره کارت | نام صاحب کارت | شبا"
+        )
+
+    @dp.message_handler(commands=["add_product"])
+    async def add_prod(msg: types.Message):
+        if not is_admin_tg(msg.from_user.id):
+            return
+        parts = [p.strip() for p in msg.get_args().split("|")]
+        if len(parts) < 2:
+            return await msg.reply("فرمت: /add_product نام | قیمت | [اجازه تست 0/1] | توضیح")
+        name, price = parts[0], float(parts[1])
+        allow_test = bool(int(parts[2])) if len(parts) > 2 else False
+        desc = parts[3] if len(parts) > 3 else ""
+        add_product(name, price, desc, allow_test)
+        await msg.reply(f"✅ محصول '{name}' افزوده شد.")
+
+    @dp.message_handler(commands=["set_card"])
+    async def set_card(msg: types.Message):
+        if not is_admin_tg(msg.from_user.id):
+            return
+        parts = [p.strip() for p in msg.get_args().split("|")]
+        if len(parts) < 3:
+            return await msg.reply("فرمت: /set_card شماره کارت | نام | شبا")
+        set_setting("card_number", parts[0])
+        set_setting("card_owner", parts[1])
+        set_setting("card_sheba", parts[2])
+        await msg.reply("✅ اطلاعات کارت ذخیره شد.")
+
+def main():
+    token, admin_id = bootstrap_env()
+    init_db_and_admin(admin_id)
+    bot, dp = build_bot(token)
+    register_handlers(dp, bot)
+    print("🚀 Bot running... Press Ctrl+C to stop.")
+    executor.start_polling(dp, skip_updates=True)
+
+if __name__ == "__main__":
+    main()
